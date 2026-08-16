@@ -276,9 +276,8 @@ bot.on('ready', (session) => {
     console.log(`[bot] online id=${botId}, room=${roomName} (${room})`);
 });
 
-bot.on('chatCreate', async (user, message) => {
+bot.on('chatCreate', (user, message) => {
     console.log(`[chat] ${user.username}: ${message}`);
-    await handleModMessage(user, message, (text) => bot.message.send(text));
 });
 
 bot.on('whisperCreate', async (user, message) => {
