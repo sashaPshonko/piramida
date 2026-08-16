@@ -1,4 +1,9 @@
 const { Highrise, Events } = require('highrise.sdk.dev');
+const {
+    BuyVoiceTimeRequest,
+    CheckVoiceChatRequest,
+    SendPayloadAndGetResponse,
+} = require('highrise.sdk.dev/src/utils/Models');
 
 // --- config ---
 const token = 'f9b4d0c89c4914bcb7048f75500995c62bd4347890f29bd12f4cd589d3205480';
@@ -13,6 +18,8 @@ const ADMIN_USERNAMES = new Set([
 const DEFAULT_BAN_SECONDS = 3200;
 const MOD_HELP = 'кик @nick | бан @nick [сек] | разбан @nick | войс @nick | невойс @nick | включитьвойс | войсстат';
 
+const MOD_ACTIONS = new Set(['кик', 'бан', 'разбан', 'войс', 'невойс']);
+
 const bot = new Highrise({
     Events: [Events.Messages, Events.DirectMessages],
 });
@@ -21,13 +28,17 @@ function isAdmin(user) {
     return ADMIN_USERNAMES.has(String(user.username || '').toLowerCase());
 }
 
-/** "кик @Nick Name" → { action, username } */
+/** "кик @Nick" → { action, username } — ник только с @ */
 function parseUserAction(input) {
     const trimmed = String(input || '').trim();
     const [actionRaw, ...rest] = trimmed.split(/\s+/);
     if (!actionRaw || rest.length === 0) return null;
 
     const action = actionRaw.toLowerCase();
+    if (!MOD_ACTIONS.has(action)) return null;
+
+    if (!rest[0]?.startsWith('@')) return null;
+
     const username = rest.join(' ').replace(/^@/, '').trim();
     if (!username) return null;
 
@@ -45,10 +56,38 @@ async function findPlayerId(username) {
 
 async function getVoiceSeconds() {
     try {
-        return await bot.room.voice.get.seconds();
+        const payload = {
+            _type: 'CheckVoiceChatRequest',
+            rid: bot.room.voice.rid,
+        };
+        const sender = new SendPayloadAndGetResponse(bot);
+        const response = await sender.sendPayloadAndGetResponse(
+            payload,
+            CheckVoiceChatRequest.Response,
+        );
+        const raw = response.seconds_left;
+        if (typeof raw === 'number') return raw;
+        return Number(raw?.seconds_left) || 0;
     } catch {
         return 0;
     }
+}
+
+/** SDK bug: wallet.voice.buy() падает на paymentMethods — шлём запрос сами */
+async function buyVoiceTime(paymentMethod = 'bot_wallet_only') {
+    const payload = {
+        _type: 'BuyVoiceTimeRequest',
+        payment_method: paymentMethod,
+        rid: bot.wallet.rid,
+    };
+    const sender = new SendPayloadAndGetResponse(bot);
+    const response = await sender.sendPayloadAndGetResponse(
+        payload,
+        BuyVoiceTimeRequest.Response,
+    );
+    const raw = response.result;
+    if (typeof raw === 'string') return raw;
+    return raw?.result ?? null;
 }
 
 async function enableRoomVoice() {
@@ -57,7 +96,11 @@ async function enableRoomVoice() {
         return { text: `voice уже активен (${before}с)`, silent: false };
     }
 
-    const result = await bot.wallet.voice.buy('bot_wallet_priority', 1);
+    let result = await buyVoiceTime('bot_wallet_only');
+    if (result === 'insufficient_funds') {
+        result = await buyVoiceTime('bot_wallet_priority');
+    }
+
     const after = await getVoiceSeconds();
 
     if (result === 'success' || after > 0) {
@@ -105,6 +148,7 @@ async function handleModMessage(sender, rawMessage, reply) {
     if (!isAdmin(sender)) return false;
 
     const msg = rawMessage.trim().toLowerCase();
+    if (!msg) return false;
 
     if (msg === 'мод') {
         await reply(MOD_HELP);
