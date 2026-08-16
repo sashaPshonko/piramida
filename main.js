@@ -117,8 +117,10 @@ async function handleModMessage(sender, rawMessage, reply) {
     return true;
 }
 
-bot.on('ready', () => {
-    console.log(`[bot] online as ${bot.info.user.username}, room ${room}`);
+bot.on('ready', (session) => {
+    const botId = session?.user_id ?? bot.info.user.id;
+    const roomName = session?.room_info?.room_name ?? room;
+    console.log(`[bot] online id=${botId}, room=${roomName} (${room})`);
 });
 
 bot.on('chatCreate', async (user, message) => {
