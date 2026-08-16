@@ -1,9 +1,5 @@
 const { Highrise, Events } = require('highrise.sdk.dev');
-const {
-    BuyVoiceTimeRequest,
-    CheckVoiceChatRequest,
-    SendPayloadAndGetResponse,
-} = require('highrise.sdk.dev/src/utils/Models');
+const { generateRid } = require('highrise.sdk.dev/src/utils/Rid');
 
 // --- config ---
 const token = 'f9b4d0c89c4914bcb7048f75500995c62bd4347890f29bd12f4cd589d3205480';
@@ -16,13 +12,53 @@ const ADMIN_USERNAMES = new Set([
 ]);
 
 const DEFAULT_BAN_SECONDS = 3200;
-const MOD_HELP = 'кик @nick | бан @nick [сек] | разбан @nick | войс @nick | невойс @nick | включитьвойс | войсстат';
+const MOD_HELP = 'кик @nick | бан @nick [сек] | разбан @nick | войс @nick | невойс @nick | включитьвойс | войсстат | бал';
 
 const MOD_ACTIONS = new Set(['кик', 'бан', 'разбан', 'войс', 'невойс']);
 
 const bot = new Highrise({
     Events: [Events.Messages, Events.DirectMessages],
 });
+
+/** SDK SendPayloadAndGetResponse ловит любой Error без rid — шлём сами */
+function apiRequest(payload, responseType) {
+    return new Promise((resolve, reject) => {
+        const rid = generateRid();
+
+        const cleanup = () => {
+            bot.ws.removeEventListener('message', errorHandler);
+            bot.ws.removeEventListener('message', messageHandler);
+        };
+
+        const errorHandler = (event) => {
+            let data;
+            try {
+                data = JSON.parse(event.data);
+            } catch {
+                return;
+            }
+            if (data._type !== 'Error' || data.rid !== rid) return;
+            cleanup();
+            reject(Object.assign(new Error(data.message || 'API error'), { raw: data }));
+        };
+
+        const messageHandler = (event) => {
+            let data;
+            try {
+                data = JSON.parse(event.data);
+            } catch {
+                return;
+            }
+            if (data._type !== responseType || data.rid !== rid) return;
+            cleanup();
+            resolve(data);
+        };
+
+        bot.ws.addEventListener('message', errorHandler);
+        bot.ws.addEventListener('message', messageHandler);
+        bot.ws.send(JSON.stringify({ ...payload, rid }));
+    });
+}
 
 function isAdmin(user) {
     return ADMIN_USERNAMES.has(String(user.username || '').toLowerCase());
@@ -54,63 +90,71 @@ async function findPlayerId(username) {
     return hit?.[0]?.id ?? null;
 }
 
-async function getVoiceSeconds() {
+async function getWalletBalance() {
+    const data = await apiRequest({ _type: 'GetWalletRequest' }, 'GetWalletResponse');
+    const map = {};
+    for (const item of data.content || []) {
+        map[item.type] = item.amount;
+    }
+    return map;
+}
+
+function formatBalance(wallet) {
+    const gold = wallet.gold ?? 0;
+    const voice = wallet.room_voice_tokens ?? 0;
+    const boost = wallet.room_boost_tokens ?? 0;
+    return `gold: ${gold} | voice: ${voice} | boost: ${boost}`;
+}
+
+async function getVoiceStatus() {
     try {
-        const payload = {
-            _type: 'CheckVoiceChatRequest',
-            rid: bot.room.voice.rid,
-        };
-        const sender = new SendPayloadAndGetResponse(bot);
-        const response = await sender.sendPayloadAndGetResponse(
-            payload,
-            CheckVoiceChatRequest.Response,
+        const data = await apiRequest(
+            { _type: 'CheckVoiceChatRequest' },
+            'CheckVoiceChatResponse',
         );
-        const raw = response.seconds_left;
-        if (typeof raw === 'number') return raw;
-        return Number(raw?.seconds_left) || 0;
-    } catch {
-        return 0;
+        return { ok: true, seconds: Number(data.seconds_left) || 0 };
+    } catch (err) {
+        const msg = String(err.message || '');
+        if (msg.toLowerCase().includes('not voice enabled')) {
+            return { ok: false, reason: 'room_disabled' };
+        }
+        return { ok: false, reason: 'error', message: msg };
     }
 }
 
-/** SDK bug: wallet.voice.buy() падает на paymentMethods — шлём запрос сами */
-async function buyVoiceTime(paymentMethod = 'bot_wallet_only') {
-    const payload = {
-        _type: 'BuyVoiceTimeRequest',
-        payment_method: paymentMethod,
-        rid: bot.wallet.rid,
-    };
-    const sender = new SendPayloadAndGetResponse(bot);
-    const response = await sender.sendPayloadAndGetResponse(
-        payload,
-        BuyVoiceTimeRequest.Response,
+async function buyVoiceTime() {
+    const data = await apiRequest(
+        { _type: 'BuyVoiceTimeRequest', payment_method: 'bot_wallet_only' },
+        'BuyVoiceTimeResponse',
     );
-    const raw = response.result;
-    if (typeof raw === 'string') return raw;
-    return raw?.result ?? null;
+    return data.result;
 }
 
 async function enableRoomVoice() {
-    const before = await getVoiceSeconds();
-    if (before > 0) {
-        return { text: `voice уже активен (${before}с)`, silent: false };
+    const status = await getVoiceStatus();
+
+    if (status.ok && status.seconds > 0) {
+        return { text: `voice уже активен (${status.seconds}с)`, silent: false };
     }
 
-    let result = await buyVoiceTime('bot_wallet_only');
-    if (result === 'insufficient_funds') {
-        result = await buyVoiceTime('bot_wallet_priority');
+    if (status.reason === 'room_disabled') {
+        return {
+            text: 'voice не включён в настройках комнаты — включи в приложении, потом снова включитьвойс',
+            silent: false,
+        };
     }
 
-    const after = await getVoiceSeconds();
+    const result = await buyVoiceTime();
+    const after = await getVoiceStatus();
 
-    if (result === 'success' || after > 0) {
-        return { text: `voice включён (${after}с)`, silent: false };
+    if (result === 'success' || (after.ok && after.seconds > 0)) {
+        return { text: `voice включён (${after.seconds ?? '?'}с)`, silent: false };
     }
     if (result === 'only_token_bought') {
         return { text: 'токен куплен, но в комнату не применился — нет прав?', silent: false };
     }
     if (result === 'insufficient_funds') {
-        return { text: 'не хватает gold на voice', silent: false };
+        return { text: 'не хватает gold на кошельке бота для voice', silent: false };
     }
     return { text: `voice buy: ${result ?? '?'}`, silent: false };
 }
@@ -160,15 +204,32 @@ async function handleModMessage(sender, rawMessage, reply) {
             const res = await enableRoomVoice();
             await reply(res.text);
         } catch (err) {
-            console.error('[voice] enable:', err?.message || err);
+            console.error('[voice] enable:', err?.message || err, err?.raw || '');
             await reply(`ошибка voice: ${err?.message || err}`);
         }
         return true;
     }
 
     if (msg === 'войсстат') {
-        const sec = await getVoiceSeconds();
-        await reply(sec > 0 ? `voice активен: ${sec}с` : 'voice выключен');
+        const status = await getVoiceStatus();
+        if (status.ok) {
+            await reply(status.seconds > 0 ? `voice активен: ${status.seconds}с` : 'voice выключен (0с)');
+        } else if (status.reason === 'room_disabled') {
+            await reply('voice не включён в настройках комнаты');
+        } else {
+            await reply(`voice статус: ${status.message || 'ошибка'}`);
+        }
+        return true;
+    }
+
+    if (msg === 'бал') {
+        try {
+            const wallet = await getWalletBalance();
+            await reply(formatBalance(wallet));
+        } catch (err) {
+            console.error('[wallet]:', err?.message || err);
+            await reply(`ошибка баланса: ${err?.message || err}`);
+        }
         return true;
     }
 
@@ -215,13 +276,11 @@ bot.on('ready', (session) => {
     console.log(`[bot] online id=${botId}, room=${roomName} (${room})`);
 });
 
-// в общий чат — ответ в чат (не шепот); кик/бан без спама
 bot.on('chatCreate', async (user, message) => {
     console.log(`[chat] ${user.username}: ${message}`);
     await handleModMessage(user, message, (text) => bot.message.send(text));
 });
 
-// в личку боту — ответ шепотом
 bot.on('whisperCreate', async (user, message) => {
     console.log(`[whisper] ${user.username}: ${message}`);
     await handleModMessage(user, message, (text) => bot.whisper.send(user.id, text));
